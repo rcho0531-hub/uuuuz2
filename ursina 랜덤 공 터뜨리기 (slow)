@@ -1,0 +1,274 @@
+from ursina import *
+from ursina.prefabs.first_person_controller import FirstPersonController
+from ursina.shaders import lit_with_shadows_shader
+import random
+
+app = Ursina()
+mouse.locked = True
+
+# =========================
+# 게임 설정
+# =========================
+GAME_TIME = 60.0
+time_left = GAME_TIME
+score = 0
+game_over = False
+
+# =========================
+# UI (오른쪽으로 이동)
+# =========================
+timer_text = Text(
+    text='Time: 60',
+    position=(-0.55, 0.45),   # 👉 오른쪽 이동
+    scale=2,
+    origin=(0,0),
+    color=color.white 
+)
+
+score_text = Text(
+    text='Score: 0',
+    position=(-0.55, 0.4),    # 👉 오른쪽 이동
+    scale=2,
+    origin=(0,0),
+    color=color.yellow
+)
+
+gameover_text = Text(
+    text='GAME OVER',
+    scale=4,
+    color=color.red,
+    origin=(0,0),
+    enabled=False
+)
+
+# =========================
+# 조명
+# =========================
+sun = DirectionalLight(shadows=True, shadow_map_resolution=(2048,2048))
+sun.look_at(Vec3(1,-1,1))
+Entity.default_shader = lit_with_shadows_shader
+AmbientLight(color=color.rgba(120,120,120,0.5))
+
+# =========================
+# 바닥
+# =========================
+GROUND_Y = 0
+ground = Entity(
+    model='plane',
+    scale=60,
+    texture='white_cube',
+    texture_scale=(60,60),
+    collider='box',
+    receive_shadows=True
+)
+
+# =========================
+# 플레이어
+# =========================
+player = FirstPersonController(position=(0,2,0), speed=5.5)
+player.gravity = 0
+player.jump_height = 0
+player.collider = BoxCollider(player, Vec3(0,1,0), Vec3(1,2,1))
+
+y_velocity = 0
+GRAVITY = 30
+JUMP_FORCE = 9
+
+MAP_MIN, MAP_MAX = -15, 15
+
+# =========================
+# 구체 최대 높이
+# =========================
+MAX_SPHERE_Y = 20.0
+
+# =========================
+# 파편 데이터
+# =========================
+PLANE_MODELS = ['quad', 'triangle']
+RAINBOW_COLORS = [
+    color.red, color.orange, color.yellow,
+    color.green, color.cyan, color.blue, color.violet
+]
+
+MAX_SHARDS = 300
+shard_pool = []
+
+# =========================
+# 파편 클래스
+# =========================
+class Shard(Entity):
+    def __init__(self):
+        super().__init__(
+            model=random.choice(PLANE_MODELS),
+            scale=(0.4, 0.4, 0.01),
+            double_sided=True,
+            enabled=False
+        )
+        self.velocity = Vec3()
+        self.angular_velocity = Vec3()
+        self.bounce_left = 0
+        self.fade = 0
+
+    def activate(self, pos):
+        self.position = pos
+        self.rotation = Vec3(
+            random.uniform(0,360),
+            random.uniform(0,360),
+            random.uniform(0,360)
+        )
+        self.scale = Vec3(
+            random.uniform(0.25,0.6),
+            random.uniform(0.25,0.6),
+            0.01
+        )
+
+        self.color = random.choice(RAINBOW_COLORS)
+        self.base_color = self.color
+
+        self.velocity = Vec3(
+            random.uniform(-6,6),
+            random.uniform(5,10),
+            random.uniform(-6,6)
+        )
+        self.angular_velocity = Vec3(
+            random.uniform(-200,200),
+            random.uniform(-200,200),
+            random.uniform(-200,200)
+        )
+        self.bounce_left = random.randint(2,5)
+        self.fade = 1
+        self.enabled = True
+
+    def update(self):
+        if not self.enabled:
+            return
+
+        self.velocity.y -= 28 * time.dt
+        self.position += self.velocity * time.dt
+        self.rotation += self.angular_velocity * time.dt
+
+        if self.y <= GROUND_Y:
+            self.y = GROUND_Y
+            if self.bounce_left > 0:
+                self.velocity.y = random.uniform(1.5,3.2)
+                self.velocity *= 0.6
+                self.bounce_left -= 1
+            else:
+                self.velocity *= 0.9
+
+        if self.bounce_left <= 0:
+            self.fade -= time.dt * 0.7
+            self.color = color.rgba(
+                int(self.base_color.r * 255),
+                int(self.base_color.g * 255),
+                int(self.base_color.b * 255),
+                int(255 * self.fade)
+            )
+
+        if self.fade <= 0:
+            self.enabled = False
+
+# =========================
+# 파편 풀 생성
+# =========================
+for _ in range(MAX_SHARDS):
+    shard_pool.append(Shard())
+
+def explode(pos):
+    used = 0
+    for s in shard_pool:
+        if not s.enabled:
+            s.activate(pos)
+            used += 1
+            if used >= 35:
+                break
+
+# =========================
+# 주황 구체
+# =========================
+obstacles = []
+
+def spawn_obstacle():
+    o = Entity(
+        model='sphere',
+        color=color.orange,
+        scale=2,
+        position=(
+            random.uniform(MAP_MIN,MAP_MAX),
+            random.uniform(2,6),
+            random.uniform(MAP_MIN,MAP_MAX)
+        ),
+        collider='sphere'
+    )
+    o.velocity = Vec3(
+        random.uniform(-4,4),
+        random.uniform(1,2),
+        random.uniform(-4,4)
+    )
+    obstacles.append(o)
+
+for _ in range(5):
+    spawn_obstacle()
+
+# =========================
+# 업데이트
+# =========================
+def update():
+    global y_velocity, time_left, game_over
+
+    if not game_over:
+        time_left -= time.dt
+        if time_left <= 0:
+            time_left = 0
+            game_over = True
+            gameover_text.enabled = True
+
+        timer_text.text = f'Time: {int(time_left)}'
+        score_text.text = f'Score: {score}'
+
+    y_velocity -= GRAVITY * time.dt
+    player.y += y_velocity * time.dt
+    if player.y <= GROUND_Y:
+        player.y = GROUND_Y
+        y_velocity = 0
+
+    for o in obstacles:
+        o.position += o.velocity * time.dt
+
+        if o.y < 1:
+            o.y = 1
+            o.velocity.y = abs(o.velocity.y)
+
+        if o.y > MAX_SPHERE_Y:
+            o.y = MAX_SPHERE_Y
+            if o.velocity.y > 0:
+                o.velocity.y = 0
+
+        for a in ('x','z'):
+            if getattr(o,a) < MAP_MIN or getattr(o,a) > MAP_MAX:
+                setattr(o.velocity,a,-getattr(o.velocity,a))
+
+# =========================
+# 입력
+# =========================
+def input(key):
+    global y_velocity, score
+
+    if key == 'space' and player.y <= GROUND_Y + 0.01:
+        y_velocity = JUMP_FORCE
+
+    if key == 'tab':
+        mouse.locked = not mouse.locked
+
+    if key == 'left mouse down' and not game_over:
+        target = mouse.hovered_entity
+        if target in obstacles:
+            explode(target.position)
+            obstacles.remove(target)
+            destroy(target)
+            score += 1
+
+            while len(obstacles) < 5:
+                spawn_obstacle()
+
+app.run()
