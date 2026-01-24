@@ -1,0 +1,354 @@
+from ursina import *
+from ursina.prefabs.first_person_controller import FirstPersonController
+from ursina.shaders import lit_with_shadows_shader
+import math
+
+app = Ursina()
+mouse.locked = True
+
+# =========================
+# 환경
+# =========================
+sun = DirectionalLight(shadows=True, shadow_map_resolution=(2048,2048))
+sun.look_at(Vec3(1,-1,1))
+Entity.default_shader = lit_with_shadows_shader
+AmbientLight(color=color.rgba(100,100,100,0.5))
+
+GROUND_Y = 0
+ground = Entity(
+    model='plane',
+    scale=60,
+    texture='white_cube',
+    texture_scale=(60,60),
+    collider='box',
+    receive_shadows=True
+)
+
+# =========================
+# 플레이어
+# =========================
+spawn_point = Vec3(0,2,0)
+player = FirstPersonController(position=spawn_point, speed=0)
+player.gravity = 0
+player.jump_height = 0
+player.collider = BoxCollider(player, Vec3(0,1,0), Vec3(1,2,1))
+
+# =========================
+# 이동 세팅
+# =========================
+normal_speed = 5.5
+crouch_speed = 2.5
+
+initial_speed = 3.0
+ground_accel_time = 0.08
+ground_decel_speed = 20
+
+normal_cam_y = 1.8
+crouch_cam_y = 1.3
+player.camera_pivot.y = normal_cam_y
+
+air_turn_strength = 4.0
+air_brake = 8.0
+air_max_speed = 9.0
+
+# 점프 후 가속 (108%)
+jump_bonus_max = 1.08
+jump_bonus_ramp = 0.25
+jump_bonus_delay = 0.15
+
+jump_bonus = 1.0
+jump_delay_timer = 0.0
+
+current_speed = 0
+move_velocity = Vec3(0,0,0)
+
+# =========================
+# 점프 / 중력
+# =========================
+y_velocity = 0
+JUMP_FORCE = 9
+GRAVITY = 30
+TERMINAL_VELOCITY = -50
+
+# =========================
+# 무기 공통 스프링 변수
+# =========================
+gun_bob_timer = 0
+gun_jump_offset = 0
+gun_jump_velocity = 0
+
+GUN_JUMP_STIFFNESS = 25
+GUN_JUMP_DAMPING = 8
+GUN_JUMP_PUSH = 0.12
+
+# 화면 회전 스웨이
+last_cam_rot = Vec3(0,0,0)
+weapon_rot_sway = Vec3(0,0,0)
+ROT_SWAY_STRENGTH = 6.5
+ROT_SWAY_DAMPING = 12
+
+# =========================
+# 🔫 총
+# =========================
+gun_parent = Entity(
+    parent=camera,
+    position=Vec3(0.4, -0.6, 0.6),
+    rotation=Vec3(0,0,0),
+    enabled=False
+)
+
+gun_base_pos = Vec3(0.4, -0.3, 0.6)
+gun_hide_pos = Vec3(0.4, -0.6, 0.6)
+gun_base_rot = Vec3(0,0,0)
+
+Entity(parent=gun_parent, model='cube',
+       scale=Vec3(0.3,0.2,0.8), color=color.dark_gray)
+Entity(parent=gun_parent, model='cube',
+       scale=Vec3(0.15,0.35,0.2),
+       position=Vec3(-0.05,-0.35,-0.15),
+       rotation=Vec3(0,0,10),
+       color=color.black)
+Entity(parent=gun_parent, model='cube',
+       scale=Vec3(0.1,0.1,0.4),
+       position=Vec3(0,0,0.6),
+       color=color.gray)
+
+# =========================
+# 🔪 칼 (더 날카로운 디자인)
+# =========================
+knife_parent = Entity(
+    parent=camera,
+    position=Vec3(0.45, -0.8, 0.6),
+    rotation=Vec3(10, -25, 10),
+    enabled=False
+)
+
+knife_base_pos = Vec3(0.45, -0.35, 0.6)
+knife_hide_pos = Vec3(0.45, -0.8, 0.6)
+knife_base_rot = Vec3(10, -25, 10)
+
+# 손잡이
+knife_handle = Entity(
+    parent=knife_parent,
+    model='cube',
+    scale=Vec3(0.06, 0.22, 0.06),
+    color=color.rgb(50,30,20),
+    position=Vec3(0, -0.15, 0)
+)
+
+# 가드
+knife_guard = Entity(
+    parent=knife_parent,
+    model='cube',
+    scale=Vec3(0.14, 0.015, 0.07),
+    color=color.black,
+    position=Vec3(0, -0.02, 0)
+)
+
+# 칼날 메인 (얇고 길게)
+knife_blade = Entity(
+    parent=knife_parent,
+    model='cube',
+    scale=Vec3(0.025, 0.6, 0.01),
+    color=color.light_gray,
+    position=Vec3(0, 0.35, 0)
+)
+
+# 칼날 중앙 능선 (날카로움 강조)
+knife_ridge = Entity(
+    parent=knife_parent,
+    model='cube',
+    scale=Vec3(0.01, 0.55, 0.005),
+    color=color.white,
+    position=Vec3(0, 0.35, -0.005)
+)
+
+# 칼 끝 (삼각형 느낌)
+knife_tip1 = Entity(
+    parent=knife_parent,
+    model='cube',
+    scale=Vec3(0.02, 0.12, 0.01),
+    color=color.light_gray,
+    position=Vec3(0, 0.68, 0),
+    rotation=Vec3(0,0,15)
+)
+
+knife_tip2 = Entity(
+    parent=knife_parent,
+    model='cube',
+    scale=Vec3(0.02, 0.12, 0.01),
+    color=color.light_gray,
+    position=Vec3(0, 0.68, 0),
+    rotation=Vec3(0,0,-15)
+)
+
+# =========================
+# 무기 상태
+# =========================
+current_weapon = None
+weapon_anim = 0.0
+weapon_anim_speed = 7.0
+
+
+def update():
+    global y_velocity, current_speed, move_velocity
+    global jump_bonus, jump_delay_timer
+    global gun_bob_timer, gun_jump_offset, gun_jump_velocity
+    global last_cam_rot, weapon_rot_sway, weapon_anim
+
+    # 중력
+    y_velocity -= GRAVITY * time.dt
+    y_velocity = max(y_velocity, TERMINAL_VELOCITY)
+    player.y += y_velocity * time.dt
+
+    on_ground = False
+    if player.y <= GROUND_Y:
+        player.y = GROUND_Y
+        y_velocity = 0
+        on_ground = True
+        jump_bonus = 1.0
+        jump_delay_timer = 0
+
+    # 웅크리기
+    crouching = held_keys['left shift']
+    player.camera_pivot.y = lerp(
+        player.camera_pivot.y,
+        crouch_cam_y if crouching else normal_cam_y,
+        time.dt * 10
+    )
+
+    # 이동 입력
+    direction = Vec3(
+        held_keys['d'] - held_keys['a'],
+        0,
+        held_keys['w'] - held_keys['s']
+    )
+
+    if direction.length() > 0:
+        direction = camera.forward * direction.z + camera.right * direction.x
+        direction.y = 0
+        direction = direction.normalized()
+
+    target_speed = crouch_speed if crouching else normal_speed
+
+    if on_ground:
+        if direction.length() > 0:
+            if current_speed < 0.1:
+                current_speed = initial_speed
+            accel = time.dt / ground_accel_time
+            current_speed = lerp(current_speed, target_speed, accel)
+            move_velocity = lerp(move_velocity, direction * current_speed, accel)
+        else:
+            current_speed = lerp(current_speed, 0, time.dt * ground_decel_speed)
+            move_velocity = lerp(move_velocity, Vec3(0,0,0), time.dt * ground_decel_speed)
+    else:
+        if jump_delay_timer > 0:
+            jump_delay_timer -= time.dt
+        else:
+            jump_bonus = lerp(jump_bonus, jump_bonus_max, time.dt * jump_bonus_ramp)
+
+        if direction.length() > 0 and move_velocity.length() > 0:
+            vel_dir = move_velocity.normalized()
+            input_dir = direction.normalized()
+            dot = vel_dir.dot(input_dir)
+            if dot < -0.4:
+                move_velocity = lerp(move_velocity, Vec3(0,0,0), time.dt * air_brake)
+            else:
+                speed = move_velocity.length()
+                new_dir = lerp(vel_dir, input_dir, time.dt * air_turn_strength).normalized()
+                move_velocity = new_dir * speed
+
+        base_speed = move_velocity.length()
+        move_velocity = move_velocity.normalized() * base_speed * jump_bonus
+        if move_velocity.length() > air_max_speed:
+            move_velocity = move_velocity.normalized() * air_max_speed
+
+    player.position += move_velocity * time.dt
+
+    # =========================
+    # 무기 처리
+    # =========================
+    active_weapon = None
+    base_pos = None
+    base_rot = None
+    hide_pos = None
+
+    if current_weapon == "gun":
+        active_weapon = gun_parent
+        base_pos = gun_base_pos
+        base_rot = gun_base_rot
+        hide_pos = gun_hide_pos
+    elif current_weapon == "knife":
+        active_weapon = knife_parent
+        base_pos = knife_base_pos
+        base_rot = knife_base_rot
+        hide_pos = knife_hide_pos
+
+    if active_weapon:
+        weapon_anim = lerp(weapon_anim, 1, time.dt * weapon_anim_speed)
+        base = lerp(hide_pos, base_pos, weapon_anim)
+
+        speed_ratio = clamp(move_velocity.length() / normal_speed, 0, 1.5)
+
+        if on_ground and speed_ratio > 0.05:
+            gun_bob_timer += time.dt * (6 + speed_ratio * 6)
+        else:
+            gun_bob_timer += time.dt * 2
+
+        bob_x = math.sin(gun_bob_timer) * 0.01 * speed_ratio
+        bob_y = abs(math.cos(gun_bob_timer)) * 0.015 * speed_ratio
+        bob_rot = math.sin(gun_bob_timer) * 1.5 * speed_ratio
+
+        gun_jump_velocity -= gun_jump_offset * GUN_JUMP_STIFFNESS * time.dt
+        gun_jump_velocity *= math.exp(-GUN_JUMP_DAMPING * time.dt)
+        gun_jump_offset += gun_jump_velocity * time.dt
+
+        cam_rot = camera.rotation
+        rot_delta = cam_rot - last_cam_rot
+        last_cam_rot = cam_rot
+
+        weapon_rot_sway.x = lerp(weapon_rot_sway.x, -rot_delta.x * ROT_SWAY_STRENGTH, time.dt * ROT_SWAY_DAMPING)
+        weapon_rot_sway.y = lerp(weapon_rot_sway.y, -rot_delta.y * ROT_SWAY_STRENGTH, time.dt * ROT_SWAY_DAMPING)
+
+        active_weapon.position = Vec3(
+            base.x + bob_x,
+            base.y - bob_y + gun_jump_offset,
+            base.z
+        )
+
+        active_weapon.rotation = Vec3(
+            base_rot.x + bob_rot + weapon_rot_sway.x,
+            base_rot.y + weapon_rot_sway.y,
+            base_rot.z
+        )
+
+
+def input(key):
+    global y_velocity, current_weapon, weapon_anim
+    global jump_bonus, jump_delay_timer, gun_jump_velocity
+
+    if key == 'space' and player.y <= GROUND_Y + 0.01:
+        y_velocity = JUMP_FORCE
+        jump_bonus = 1.0
+        jump_delay_timer = jump_bonus_delay
+        gun_jump_velocity += GUN_JUMP_PUSH
+
+    if key == 'tab':
+        mouse.locked = not mouse.locked
+
+    # 1번 = 총
+    if key == '1':
+        current_weapon = "gun"
+        gun_parent.enabled = True
+        knife_parent.enabled = False
+        weapon_anim = 0
+
+    # 3번 = 칼
+    if key == '3':
+        current_weapon = "knife"
+        knife_parent.enabled = True
+        gun_parent.enabled = False
+        weapon_anim = 0
+
+
+app.run()
