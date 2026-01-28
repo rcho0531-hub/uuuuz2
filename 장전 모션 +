@@ -1,0 +1,286 @@
+from ursina import *
+from ursina.prefabs.first_person_controller import FirstPersonController
+from ursina.shaders import lit_with_shadows_shader
+import math
+import random
+
+app = Ursina()
+mouse.locked = True
+
+# =========================
+# 🎨 환경 및 비주얼 설정
+# =========================
+sun = DirectionalLight(shadows=True, shadow_map_resolution=(2048,2048))
+sun.look_at(Vec3(1,-1,1))
+Entity.default_shader = lit_with_shadows_shader
+AmbientLight(color=color.rgba(100,100,100,0.5))
+Sky(color=color.light_gray)
+
+GROUND_Y = 0
+
+ground = Entity(model='plane', scale=60, color=color.rgb(139, 69, 19), collider='box', receive_shadows=True)
+target = Entity(model='cube', position=(5, 1, 10), color=color.red, collider='box', scale=(1,2,1))
+crosshair = Entity(parent=camera.ui, model='quad', scale=0.005, color=color.green)
+
+# =========================
+# 📦 탄약 시스템 변수
+# =========================
+weapon_stats = {
+    "rifle":  {"ammo": 30, "reserve": 90, "mag_size": 30, "reload_time": 1.5},
+    "pistol": {"ammo": 12, "reserve": 48, "mag_size": 12, "reload_time": 1.0},
+    "knife":  {"ammo": 0,  "reserve": 0,  "mag_size": 0,  "reload_time": 0}
+}
+
+is_reloading = False
+
+ammo_text = Text(text='30 / 90', position=(0.7, -0.4), origin=(1, 0), scale=2, color=color.white)
+
+def update_ammo_ui():
+    if current_weapon == "knife": ammo_text.text = "" 
+    else:
+        stats = weapon_stats[current_weapon]
+        ammo_text.text = f'{stats["ammo"]} / {stats["reserve"]}'
+
+def reload():
+    global is_reloading
+    if is_reloading or current_weapon == "knife": return
+    
+    stats = weapon_stats[current_weapon]
+    if stats["ammo"] >= stats["mag_size"] or stats["reserve"] <= 0: return
+
+    is_reloading = True
+    invoke(finish_reload, delay=stats["reload_time"])
+
+def finish_reload():
+    global is_reloading
+    if not is_reloading: return 
+    stats = weapon_stats[current_weapon]
+    needed = stats["mag_size"] - stats["ammo"]
+    amount = min(needed, stats["reserve"])
+    stats["ammo"] += amount
+    stats["reserve"] -= amount
+    is_reloading = False
+    update_ammo_ui()
+
+# =========================
+# 🏃 플레이어 물리 엔진
+# =========================
+player = FirstPersonController(position=(0, 2, 0), speed=0)
+player.gravity = 0
+player.jump_height = 0
+player.collider = BoxCollider(player, Vec3(0,1,0), Vec3(1,2,1))
+
+normal_speed, crouch_speed, initial_speed = 6.0, 2.5, 3.0
+ground_accel_time, ground_decel_speed = 0.08, 20
+normal_cam_y, crouch_cam_y = 1.8, 1.3
+player.camera_pivot.y = normal_cam_y
+
+air_turn_strength, air_brake, air_max_speed = 4.0, 8.0, 9.0
+jump_bonus_max, jump_bonus_ramp, jump_bonus_delay = 1.08, 0.25, 0.15
+jump_bonus, jump_delay_timer = 1.0, 0.0
+
+current_speed, move_velocity, y_velocity = 0, Vec3(0,0,0), 0
+JUMP_FORCE, GRAVITY, TERMINAL_VELOCITY = 10, 30, -50
+
+# =========================
+# 🔫 무기 시스템 변수
+# =========================
+gun_bob_timer = 0
+gun_jump_offset, gun_jump_velocity = 0, 0
+GUN_JUMP_STIFFNESS, GUN_JUMP_DAMPING, GUN_JUMP_PUSH = 25, 8, 0.12
+
+last_cam_rot, weapon_rot_sway, recoil_offset = Vec3(0,0,0), Vec3(0,0,0), Vec3(0,0,0)
+ROT_SWAY_STRENGTH, ROT_SWAY_DAMPING = 6.5, 12
+fire_rate_timer, rifle_fire_rate = 0, 0.11
+
+# =========================
+# 🛠️ 무기 모델링
+# =========================
+wood_color, metal_color, black_color = color.brown, color.rgb(50, 50, 50), color.black
+
+# 1. 소총 (Rifle)
+rifle_parent = Entity(parent=camera, position=Vec3(0.5, -0.5, 0.7), enabled=False)
+rifle_base_pos, rifle_hide_pos, rifle_base_rot = Vec3(0.5, -0.25, 0.6), Vec3(0.5, -0.8, 0.7), Vec3(0,0,0)
+Entity(parent=rifle_parent, model='cube', scale=(0.08, 0.1, 0.4), color=wood_color, position=(0, 0, 0))
+Entity(parent=rifle_parent, model='cube', scale=(0.085, 0.025, 0.4), color=black_color, position=(0, 0.0625, 0))
+stock = Entity(parent=rifle_parent, model='cube', scale=(0.07, 0.12, 0.35), color=wood_color, position=(0, -0.05, -0.32), rotation=(-10,0,0))
+mag = Entity(parent=rifle_parent, model='cube', scale=(0.07, 0.3, 0.12), color=black_color, position=(0, -0.15, 0.1), rotation=(-20,0,0))
+Entity(parent=rifle_parent, model='cube', scale=(0.09, 0.11, 0.26), color=wood_color, position=(0, 0, 0.28))
+Entity(parent=rifle_parent, model='cube', scale=(0.03, 0.03, 0.45), color=black_color, position=(0, 0.02, 0.55))
+Entity(parent=rifle_parent, model='cube', scale=(0.04, 0.05, 0.05), color=black_color, position=(0, 0.05, 0.42))
+Entity(parent=rifle_parent, model='cube', scale=(0.01, 0.06, 0.01), color=black_color, position=(0, 0.06, 0.75))
+grip = Entity(parent=rifle_parent, model='cube', scale=(0.06, 0.15, 0.1), color=wood_color, position=(0, -0.15, -0.1), rotation=(15,0,0))
+
+# 2. 권총 (Pistol)
+pistol_parent = Entity(parent=camera, position=Vec3(0.35, -0.6, 0.5), enabled=False)
+pistol_base_pos, pistol_hide_pos, pistol_base_rot = Vec3(0.35, -0.3, 0.5), Vec3(0.35, -0.6, 0.5), Vec3(0, -2, 0)
+slide = Entity(parent=pistol_parent, model='cube', scale=(0.06, 0.08, 0.35), color=color.black, position=(0, 0.08, 0.05))
+grip_p = Entity(parent=pistol_parent, model='cube', scale=(0.055, 0.2, 0.09), color=wood_color, position=(0, -0.05, -0.08), rotation_x=-12)
+guard_bottom = Entity(parent=pistol_parent, model='cube', scale=(0.02, 0.01, 0.1), color=wood_color, position=(0, -0.05, 0.08))
+guard_front = Entity(parent=pistol_parent, model='cube', scale=(0.02, 0.06, 0.01), color=wood_color, position=(0, -0.02, 0.13))
+trigger = Entity(parent=pistol_parent, model='cube', scale=(0.01, 0.04, 0.01), color=color.black, position=(0, 0, 0.06), rotation_x=-20)
+barrel = Entity(parent=pistol_parent, model='cylinder', scale=(0.025, 0.025, 0.36), color=color.black, position=(0, 0.08, 0.05), rotation=(90,0,0))
+rear_sight = Entity(parent=pistol_parent, model='cube', scale=(0.06, 0.015, 0.02), color=color.black, position=(0, 0.125, -0.1))
+front_sight = Entity(parent=pistol_parent, model='cube', scale=(0.01, 0.015, 0.01), color=color.black, position=(0, 0.125, 0.2))
+mag_base = Entity(parent=grip_p, model='cube', scale=(1.1, 0.1, 1.1), color=color.black, position=(0, -0.5, 0))
+
+# 3. 칼 (Knife)
+knife_parent = Entity(parent=camera, position=Vec3(0.45, -0.8, 0.6), rotation=Vec3(5, -15, -5), enabled=False)
+knife_base_pos, knife_hide_pos, knife_base_rot = Vec3(0.45, -0.35, 0.6), Vec3(0.45, -0.8, 0.6), Vec3(5, -15, -5)
+knife_handle = Entity(parent=knife_parent, model='cube', scale=(0.06, 0.22, 0.08), color=color.dark_gray, position=(0, -0.1, 0))
+for i in range(3): Entity(parent=knife_handle, model='cube', scale=(1.1, 0.15, 1.1), color=color.black, position=(0, -0.3 + (i * 0.3), 0))
+knife_blade = Entity(parent=knife_parent, model='cube', scale=(0.04, 0.35, 0.08), color=color.gray, position=(0, 0.2, 0.01))
+Entity(parent=knife_blade, model='cube', scale=(0.5, 1.0, 0.3), color=color.light_gray, position=(0, 0, 0.5))
+
+current_weapon = None
+weapon_anim, weapon_anim_speed = 0.0, 8.0
+
+# =========================
+# 🔄 업데이트 루프
+# =========================
+def update():
+    global y_velocity, current_speed, move_velocity, jump_bonus, jump_delay_timer
+    global gun_bob_timer, gun_jump_offset, gun_jump_velocity, last_cam_rot, weapon_rot_sway, weapon_anim, recoil_offset
+    global fire_rate_timer
+
+    # 물리
+    y_velocity -= GRAVITY * time.dt
+    y_velocity = max(y_velocity, TERMINAL_VELOCITY)
+    player.y += y_velocity * time.dt
+
+    on_ground = False
+    if player.y <= GROUND_Y:
+        player.y, y_velocity, on_ground = GROUND_Y, 0, True
+        jump_bonus, jump_delay_timer = 1.0, 0
+
+    crouching = held_keys['control']
+    player.camera_pivot.y = lerp(player.camera_pivot.y, crouch_cam_y if crouching else normal_cam_y, time.dt * 10)
+
+    direction = Vec3(held_keys['d'] - held_keys['a'], 0, held_keys['w'] - held_keys['s'])
+    if direction.length() > 0:
+        direction = (camera.forward * direction.z + camera.right * direction.x)
+        direction.y = 0
+        direction = direction.normalized()
+
+    target_speed = crouch_speed if crouching else normal_speed
+
+    if on_ground:
+        if direction.length() > 0:
+            if current_speed < 0.1: current_speed = initial_speed
+            accel = time.dt / ground_accel_time
+            current_speed = lerp(current_speed, target_speed, accel)
+            move_velocity = lerp(move_velocity, direction * current_speed, accel)
+        else:
+            current_speed = lerp(current_speed, 0, time.dt * ground_decel_speed)
+            move_velocity = lerp(move_velocity, Vec3(0,0,0), time.dt * ground_decel_speed)
+    else:
+        if jump_delay_timer > 0: jump_delay_timer -= time.dt
+        else: jump_bonus = lerp(jump_bonus, jump_bonus_max, time.dt * jump_bonus_ramp)
+        if direction.length() > 0 and move_velocity.length() > 0:
+            vel_dir, input_dir = move_velocity.normalized(), direction.normalized()
+            if vel_dir.dot(input_dir) < -0.4: move_velocity = lerp(move_velocity, Vec3(0,0,0), time.dt * air_brake)
+            else:
+                speed = move_velocity.length()
+                new_dir = lerp(vel_dir, input_dir, time.dt * air_turn_strength).normalized()
+                move_velocity = new_dir * speed
+        move_velocity = move_velocity.normalized() * move_velocity.length() * jump_bonus
+        if move_velocity.length() > air_max_speed: move_velocity = move_velocity.normalized() * air_max_speed
+
+    player.position += move_velocity * time.dt
+
+    if current_weapon == "rifle" and held_keys['left mouse']:
+        fire_rate_timer -= time.dt
+        if fire_rate_timer <= 0 and not is_reloading:
+            shoot(is_auto=True)
+            fire_rate_timer = rifle_fire_rate
+    else: fire_rate_timer = 0
+
+    # 무기 애니메이션 매핑
+    mapping = {
+        "rifle": (rifle_parent, rifle_base_pos, rifle_base_rot, rifle_hide_pos),
+        "pistol": (pistol_parent, pistol_base_pos, b_rot := pistol_base_rot, pistol_hide_pos),
+        "knife": (knife_parent, knife_base_pos, knife_base_rot, knife_hide_pos)
+    }
+
+    if current_weapon in mapping:
+        active_weapon, b_pos, b_rot, h_pos = mapping[current_weapon]
+        weapon_anim = lerp(weapon_anim, 1, time.dt * weapon_anim_speed)
+        
+        current_base_pos, current_base_rot = Vec3(b_pos), Vec3(b_rot)
+        
+        # [수정됨] 재장전 시 사선으로 드는 모션 구현
+        if is_reloading:
+            # 총기를 몸쪽 사선으로 비스듬히 세움 (회전 및 위치 이동)
+            current_base_pos += Vec3(-0.1, 0.05, -0.1) # 왼쪽 위로 살짝 당김
+            current_base_rot += Vec3(-15, -25, 20)      # 사선 방향으로 회전
+
+        base = lerp(h_pos, current_base_pos, weapon_anim)
+        speed_ratio = clamp(move_velocity.length() / normal_speed, 0, 1.5)
+        gun_bob_timer += time.dt * (6 + speed_ratio * 6) if on_ground and speed_ratio > 0.05 else time.dt * 2
+        bob_x, bob_y = math.sin(gun_bob_timer) * 0.01 * speed_ratio, abs(math.cos(gun_bob_timer)) * 0.015 * speed_ratio
+        bob_rot = math.sin(gun_bob_timer) * 1.5 * speed_ratio
+
+        gun_jump_velocity -= gun_jump_offset * GUN_JUMP_STIFFNESS * time.dt
+        gun_jump_velocity *= math.exp(-GUN_JUMP_DAMPING * time.dt)
+        gun_jump_offset += gun_jump_velocity * time.dt
+
+        rot_delta = camera.rotation - last_cam_rot
+        last_cam_rot = camera.rotation
+        weapon_rot_sway.x = lerp(weapon_rot_sway.x, -rot_delta.x * ROT_SWAY_STRENGTH, time.dt * ROT_SWAY_DAMPING)
+        weapon_rot_sway.y = lerp(weapon_rot_sway.y, -rot_delta.y * ROT_SWAY_STRENGTH, time.dt * ROT_SWAY_DAMPING)
+        recoil_offset = lerp(recoil_offset, Vec3(0,0,0), time.dt * 10)
+
+        active_weapon.position = lerp(active_weapon.position, Vec3(base.x + bob_x + recoil_offset.x, base.y - bob_y + gun_jump_offset + recoil_offset.y, base.z + recoil_offset.z), time.dt * 15)
+        active_weapon.rotation = lerp(active_weapon.rotation, Vec3(current_base_rot.x + bob_rot + weapon_rot_sway.x - (recoil_offset.z * 100), current_base_rot.y + weapon_rot_sway.y, current_base_rot.z), time.dt * 15)
+
+# =========================
+# 🖱️ 입력 처리 및 슈팅
+# =========================
+def input(key):
+    global y_velocity, gun_jump_velocity, current_weapon
+    if key == 'r': reload()
+    if key == 'left mouse down' and current_weapon != 'rifle': shoot(is_auto=False)
+    if key == 'space' and player.y <= GROUND_Y + 0.01:
+        y_velocity, gun_jump_velocity = JUMP_FORCE, gun_jump_velocity + GUN_JUMP_PUSH
+    if key == '1': switch_weapon("rifle")
+    if key == '2': switch_weapon("pistol")
+    if key == '3': switch_weapon("knife")
+    if key == 'tab': mouse.locked = not mouse.locked
+
+def switch_weapon(weapon_name):
+    global current_weapon, weapon_anim, is_reloading
+    if current_weapon == weapon_name: return
+    is_reloading, current_weapon = False, weapon_name
+    update_ammo_ui()
+    weapon_anim = 0
+    rifle_parent.enabled = (weapon_name == "rifle")
+    pistol_parent.enabled = (weapon_name == "pistol")
+    knife_parent.enabled = (weapon_name == "knife")
+
+def shoot(is_auto=False):
+    global recoil_offset, is_reloading
+    if is_reloading: return
+    if current_weapon != "knife":
+        if weapon_stats[current_weapon]["ammo"] <= 0: return
+        weapon_stats[current_weapon]["ammo"] -= 1
+        update_ammo_ui()
+    if current_weapon == "knife":
+        recoil_offset = Vec3(0, 0, 3); return
+    recoil_offset = Vec3(random.uniform(-0.01, 0.01), 0.01, -0.08) if is_auto else Vec3(0, 0.04, -0.15)
+    wpn_pos = rifle_parent if current_weapon == "rifle" else pistol_parent
+    flash_offset = (0, 0.06, 0.8) if current_weapon == 'rifle' else (0, 0.08, 0.45)
+    flash_scale = 0.02 if current_weapon == 'rifle' else 0.015
+    flash = Entity(parent=wpn_pos, model='quad', scale=flash_scale, position=flash_offset, color=color.yellow, billboard=True)
+    flash.animate_color(color.clear, duration=0.015)
+    destroy(flash, delay=0.015)
+    hit_info = raycast(camera.world_position, camera.forward, distance=100, ignore=(player,))
+    if hit_info.hit:
+        hole = Entity(model='quad', parent=hit_info.entity, color=color.black, unlit=True, double_sided=True)
+        hole.world_position = hit_info.world_point + (hit_info.normal * 0.001)
+        hole.look_at(hit_info.world_point + hit_info.normal)
+        hole.world_scale = Vec3(0.05, 0.05, 0.05)
+        destroy(hole, delay=2)
+        if hit_info.entity == target: target.blink(color.brown, duration=0.1)
+
+switch_weapon("rifle")
+app.run()
